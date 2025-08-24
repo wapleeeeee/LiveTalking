@@ -66,7 +66,51 @@ def randN(N)->int:
     return random.randint(min, max - 1)
 
 def build_nerfreal(sessionid:int)->BaseReal:
-    opt.sessionid=sessionid
+    global opt, model, avatar
+    
+    # 如果 opt 还未初始化，使用默认值
+    if opt is None:
+        class DefaultOpt:
+            def __init__(self):
+                self.sessionid = sessionid
+                self.model = 'musetalk'
+                self.batch_size = 4
+                self.tts = 'doubao'
+                self.transport = 'webrtc'
+                self.avatar_id = '1'
+                self.need_sr = True
+                self.bg_img = 'bg/bg1.jpg'
+                self.customvideo_config = ''
+                self.bbox_shift = 0
+                self.fps = 25
+                self.w = 512
+                self.h = 512
+        opt = DefaultOpt()
+    else:
+        opt.sessionid=sessionid
+    
+    # 如果 model 或 avatar 未初始化，根据模型类型加载
+    if model is None or avatar is None:
+        if opt.model == 'musetalk':
+            from musereal import load_model, load_avatar
+            if model is None:
+                model = load_model()
+            if avatar is None:
+                avatar = load_avatar(getattr(opt, 'avatar_id', '1'))
+        elif opt.model == 'wav2lip':
+            from lipreal import load_model, load_avatar
+            if model is None:
+                model = load_model("./models/wav2lip.pth")
+            if avatar is None:
+                avatar = load_avatar(getattr(opt, 'avatar_id', '1'))
+        elif opt.model == 'ultralight':
+            from lightreal import load_model, load_avatar
+            if model is None:
+                model = load_model(opt)
+            if avatar is None:
+                avatar = load_avatar(getattr(opt, 'avatar_id', '1'))
+    
+    # 创建 nerfreal 实例
     if opt.model == 'wav2lip':
         from lipreal import LipReal
         nerfreal = LipReal(opt,model,avatar)
@@ -83,6 +127,7 @@ def build_nerfreal(sessionid:int)->BaseReal:
 
 #@app.route('/offer', methods=['POST'])
 async def offer(request):
+    global nerfreals, pcs
     params = await request.json()
     offer = RTCSessionDescription(sdp=params["sdp"], type=params["type"])
 
@@ -118,16 +163,29 @@ async def offer(request):
             gc.collect()
 
     player = HumanPlayer(nerfreals[sessionid])
+    
+    # 先设置 remote description
+    await pc.setRemoteDescription(offer)
+    
+    # 然后添加轨道
     audio_sender = pc.addTrack(player.audio)
     video_sender = pc.addTrack(player.video)
-    capabilities = RTCRtpSender.getCapabilities("video")
-    preferences = list(filter(lambda x: x.name == "H264", capabilities.codecs))
-    preferences += list(filter(lambda x: x.name == "VP8", capabilities.codecs))
-    preferences += list(filter(lambda x: x.name == "rtx", capabilities.codecs))
-    transceiver = pc.getTransceivers()[1]
-    transceiver.setCodecPreferences(preferences)
-
-    await pc.setRemoteDescription(offer)
+    
+    # 设置视频编解码器首选项（更安全的方式）
+    try:
+        capabilities = RTCRtpSender.getCapabilities("video")
+        preferences = list(filter(lambda x: x.name == "H264", capabilities.codecs))
+        preferences += list(filter(lambda x: x.name == "VP8", capabilities.codecs))
+        preferences += list(filter(lambda x: x.name == "rtx", capabilities.codecs))
+        
+        # 获取视频 transceiver
+        transceivers = pc.getTransceivers()
+        for transceiver in transceivers:
+            if transceiver.kind == "video" and transceiver.sender:
+                transceiver.setCodecPreferences(preferences)
+                break
+    except Exception as e:
+        logger.warning(f"Failed to set codec preferences: {e}")
 
     answer = await pc.createAnswer()
     await pc.setLocalDescription(answer)

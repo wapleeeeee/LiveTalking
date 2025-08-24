@@ -111,18 +111,144 @@ class BaseReal:
         self.asr.put_audio_frame(audio_chunk,eventpoint)
 
     def put_audio_file(self,filebyte): 
-        input_stream = BytesIO(filebyte)
-        stream = self.__create_bytes_stream(input_stream)
-        streamlen = stream.shape[0]
-        idx=0
-        while streamlen >= self.chunk:  #and self.state==State.RUNNING
-            self.put_audio_frame(stream[idx:idx+self.chunk])
-            streamlen -= self.chunk
-            idx += self.chunk
+        # 直接使用wave模块，跳过soundfile
+        import tempfile
+        import os
+        import wave
+        import struct
+        
+        try:
+            # 创建临时文件
+            with tempfile.NamedTemporaryFile(suffix='.wav', delete=False, mode='wb') as tmp_file:
+                tmp_file.write(filebyte)
+                tmp_file_path = tmp_file.name
+            
+            logger.info(f'[INFO] 音频已保存到临时文件: {tmp_file_path}, 大小: {len(filebyte)} bytes')
+            
+            # 直接使用wave模块读取，不使用soundfile
+            try:
+                with wave.open(tmp_file_path, 'rb') as wav_file:
+                    sample_rate = wav_file.getframerate()
+                    n_channels = wav_file.getnchannels()
+                    sample_width = wav_file.getsampwidth()
+                    n_frames = wav_file.getnframes()
+                    
+                    logger.info(f'[INFO] Wave读取成功: 采样率={sample_rate}Hz, 声道={n_channels}, 位宽={sample_width}bytes, 帧数={n_frames}')
+                    
+                    # 读取音频数据
+                    audio_data = wav_file.readframes(n_frames)
+                    
+                    # 转换为numpy数组
+                    if sample_width == 2:
+                        # 16-bit
+                        fmt = f'{n_frames * n_channels}h'
+                        audio_array = struct.unpack(fmt, audio_data)
+                        stream = np.array(audio_array, dtype=np.float32) / 32768.0
+                    elif sample_width == 1:
+                        # 8-bit
+                        audio_array = np.frombuffer(audio_data, dtype=np.uint8)
+                        stream = (audio_array.astype(np.float32) - 128) / 128.0
+                    else:
+                        raise ValueError(f'不支持的位宽: {sample_width}')
+                    
+                    # 如果是多声道，只取第一个
+                    if n_channels > 1:
+                        stream = stream[::n_channels]
+                        logger.info(f'[INFO] 多声道音频，只使用第一个声道')
+                    
+                    logger.info(f'[INFO] 音频数据转换成功，长度: {len(stream)}')
+                    
+                    # 重采样到16kHz
+                    if sample_rate != self.sample_rate and len(stream) > 0:
+                        logger.info(f'[INFO] 重采样: {sample_rate}Hz -> {self.sample_rate}Hz')
+                        stream = resampy.resample(x=stream, sr_orig=sample_rate, sr_new=self.sample_rate)
+                    
+                    # 删除临时文件
+                    try:
+                        os.unlink(tmp_file_path)
+                    except:
+                        pass
+                    
+                    # 分块处理
+                    streamlen = stream.shape[0]
+                    idx = 0
+                    chunk_count = 0
+                    while streamlen >= self.chunk:
+                        self.put_audio_frame(stream[idx:idx+self.chunk])
+                        streamlen -= self.chunk
+                        idx += self.chunk
+                        chunk_count += 1
+                    
+                    logger.info(f'[INFO] 音频处理完成，共发送 {chunk_count} 个数据块')
+                    
+            except wave.Error as we:
+                logger.error(f'[ERROR] Wave模块读取失败: {we}')
+                # 尝试用原始方法（作为最后的备选）
+                try:
+                    # 尝试用soundfile作为最后的备选
+                    stream, sample_rate = sf.read(tmp_file_path)
+                    logger.info(f'[INFO] Soundfile读取成功: 采样率={sample_rate}, 形状={stream.shape}')
+                    
+                    # 处理音频流
+                    stream = stream.astype(np.float32)
+                    
+                    if stream.ndim > 1:
+                        stream = stream[:, 0]
+                    
+                    if sample_rate != self.sample_rate and stream.shape[0] > 0:
+                        stream = resampy.resample(x=stream, sr_orig=sample_rate, sr_new=self.sample_rate)
+                    
+                    
+                    # 删除临时文件
+                    try:
+                        os.unlink(tmp_file_path)
+                    except:
+                        pass
+                    
+                    # 分块处理
+                    streamlen = stream.shape[0]
+                    idx = 0
+                    chunk_count = 0
+                    while streamlen >= self.chunk:
+                        self.put_audio_frame(stream[idx:idx+self.chunk])
+                        streamlen -= self.chunk
+                        idx += self.chunk
+                        chunk_count += 1
+                    
+                    logger.info(f'[INFO] Soundfile处理完成，共发送 {chunk_count} 个数据块')
+                    
+                except Exception as sfe:
+                    logger.error(f'[ERROR] Soundfile也失败: {sfe}')
+                    # 删除临时文件
+                    try:
+                        os.unlink(tmp_file_path)
+                    except:
+                        pass
+                    raise we
+                    
+        except Exception as e:
+            logger.error(f'[ERROR] 处理音频文件失败: {e}')
+            # 确保删除临时文件
+            try:
+                if 'tmp_file_path' in locals():
+                    os.unlink(tmp_file_path)
+            except:
+                pass
+            raise e
     
     def __create_bytes_stream(self,byte_stream):
         #byte_stream=BytesIO(buffer)
-        stream, sample_rate = sf.read(byte_stream) # [T*sample_rate,] float64
+        try:
+            # 确保BytesIO对象在开头位置
+            if hasattr(byte_stream, 'seek'):
+                byte_stream.seek(0)
+            
+            # 尝试直接用soundfile读取
+            stream, sample_rate = sf.read(byte_stream) # [T*sample_rate,] float64
+        except Exception as e:
+            logger.error(f'[ERROR] soundfile读取失败: {e}')
+            raise e
+        
         logger.info(f'[INFO]put audio stream {sample_rate}: {stream.shape}')
         stream = stream.astype(np.float32)
 
